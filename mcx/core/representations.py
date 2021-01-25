@@ -22,27 +22,22 @@ __all__ = [
     "sample_posterior_predictive",
 ]
 
-# -------------------------------------------------------
-#                    == LOGPDF ==
-# --------------------------------------------------------
+# --------------------------------------------------------------------
+#                            == LOGPDF ==
+# --------------------------------------------------------------------
 
 
 def logpdf(model):
-    """Returns a function that compute the model's logpdf."""
+    """Returns a function that computes the log-probability."""
     graph = copy.deepcopy(model.graph)
     graph = _logpdf_core(graph)
 
-    # no node besides the logpdf is returned
-    for node in graph.nodes():
-        if isinstance(node, Op):
-            node.is_returned = False
-
-    # Create a new 'logpdf' node that is the sum of the individual variables'
-    # contributions.
+    # Create a new `logpdf` node that is the sum of the contributions of each variable.
     def to_sum_of_logpdf(*args):
         def add(left, right):
             return cst.BinaryOperation(left, cst.Add(), right)
 
+        args = list(args)
         if len(args) == 1:
             return cst.Name(args[0].value)
         elif len(args) == 2:
@@ -50,7 +45,6 @@ def logpdf(model):
             right = cst.Name(args[1].value)
             return add(left, right)
 
-        args = list(args)
         right = args.pop()
         left = args.pop()
         expr = add(left, right)
@@ -84,41 +78,34 @@ def logpdf_contributions(model):
     graph = copy.deepcopy(model.graph)
     graph = _logpdf_core(graph)
 
-    # no node besides the logpdf is returned
-    for node in graph.nodes():
-        if isinstance(node, Op):
-            node.is_returned = False
-
     # add a new node, a dictionary that contains the contribution of each
     # variable to the log-probability.
     logpdf_contribs = [node for node in graph if isinstance(node, SampleOp)]
 
+    scopes = set()
+    scope_map = defaultdict(dict)
+    for contrib in logpdf_contribs:
+        var_name = (contrib.name).replace(f"logpdf_{contrib.scope}_", "")
+        scope_map[contrib.scope][var_name] = contrib.name
+        scopes.add(contrib.scope)
+
     def to_dictionary_of_contributions(*_):
-        scopes = [contrib.scope for contrib in logpdf_contribs]
-        contrib_names = [contrib.name for contrib in logpdf_contribs]
-        var_names = [
-            name.replace(f"logpdf_{scope}_", "")
-            for name, scope in zip(contrib_names, scopes)
-        ]
 
-        scoped = defaultdict(dict)
-        for scope, var_name, contrib_name in zip(scopes, var_names, contrib_names):
-            scoped[scope][var_name] = contrib_name
-
-        # if there is only one scope (99% of models) we return a flat dictionary
-        if len(set(scopes)) == 1:
-            scope = scopes[0]
+        # if there is only one scope we return a flat dictionary {'var': logpdf_var}
+        num_scopes = len(scopes)
+        if num_scopes == 1:
+            scope = scopes.pop()
             return cst.Dict(
                 [
                     cst.DictElement(
                         cst.SimpleString(f"'{var_name}'"), cst.Name(contrib_name)
                     )
-                    for var_name, contrib_name in scoped[scope].items()
+                    for var_name, contrib_name in scope_map[scope].items()
                 ]
             )
 
         # Otherwise we return a nested dictionary where the first level is
-        # the scope, and then the variables.
+        # the scope, and then the variables {'model': {}, 'submodel': {}}
         return cst.Dict(
             [
                 cst.DictElement(
@@ -129,21 +116,21 @@ def logpdf_contributions(model):
                                 cst.SimpleString(f"'{var_name}'"),
                                 cst.Name(contrib_name),
                             )
-                            for var_name, contrib_name in scoped[scope].items()
+                            for var_name, contrib_name in scope_map[scope].items()
                         ]
                     ),
                 )
-                for scope in scoped.keys()
+                for scope in scopes
             ]
         )
 
-    tuple_node = Op(
+    dict_node = Op(
         to_dictionary_of_contributions,
         graph.name,
         "logpdf_contributions",
         is_returned=True,
     )
-    graph.add(tuple_node, *logpdf_contribs)
+    graph.add(dict_node, *logpdf_contribs)
 
     return compile_graph(graph, model.namespace, f"{graph.name}_logpdf_contribs")
 
@@ -155,28 +142,31 @@ def _logpdf_core(graph: GraphicalModel):
     placeholders = []
     sample = []
 
-    def sample_to_logpdf(to_cst, *args, **kwargs):
+    def sampleop_to_logpdf(to_cst, *args, **kwargs):
         name = kwargs.pop("var_name")
         return cst.Call(
-            cst.Attribute(to_cst(*args, **kwargs), cst.Name("logpdf_sum")), [cst.Arg(name)]
+            cst.Attribute(to_cst(*args, **kwargs), cst.Name("logpdf_sum")),
+            [cst.Arg(name)],
         )
 
     def placeholder_to_param(name: str):
         return cst.Param(cst.Name(name))
 
-    for node in reversed(list(graph.nodes())):
-        if not isinstance(node, SampleOp):
-            continue
+    # We need to loop through the nodes in reverse order because of the compilation
+    # quirk which makes it that nodes added first to the graph appear first in the
+    # functions arguments. This should be taken care of properly before merging.
+    for node in reversed(list(graph.random_variables)):
 
-        # Create a new placeholder node with the random variable's name
-        rv_name = node.name
-        name_node = Placeholder(
-            rv_name, partial(placeholder_to_param, rv_name), rv=True
+        # Create a new placeholder node with the random variable's name.
+        # It represents the value that will be passed to the logpdf.
+        name = node.name
+        rv_placeholder = Placeholder(
+            name, partial(placeholder_to_param, name), rv=True
         )
-        placeholders.append(name_node)
+        placeholders.append(rv_placeholder)
 
         # Update the nodes
-        node.to_cst = partial(sample_to_logpdf, node.to_cst)
+        node.to_cst = partial(sampleop_to_logpdf, node.to_cst)
         node.name = f"logpdf_{node.scope}_{node.name}"
 
         # The random variables now must be placeholder nodes pointing to
@@ -197,6 +187,11 @@ def _logpdf_core(graph: GraphicalModel):
 
         for e in to_remove:
             graph.remove_edge(*e)
+
+    # mark returned nodes as not returned
+    for node in graph.nodes():
+        if isinstance(node, Op):
+            node.is_returned = False
 
     return graph
 
